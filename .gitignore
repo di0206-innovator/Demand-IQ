@@ -1,0 +1,89 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# uv & pip caches
+.uv/
+.cache/
+
+# Testing & Linting
+.coverage
+.coverage.*
+.pytest_cache/
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE & OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data files (keep raw & processed data out of Git, except documentation/.gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/README.md
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/README.md
+
+# Model artifacts and checkpoints
+models/*
+!models/.gitkeep
+*.joblib
+*.pkl
+*.onnx
+
+# Reports and generated figures (preserve directory structure)
+reports/figures/*
+!reports/figures/.gitkeep
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
