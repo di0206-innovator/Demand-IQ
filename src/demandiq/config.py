@@ -1,10 +1,11 @@
 """Configuration module for DemandIQ.
 
-Centralizes paths, dataset schemas, split parameters, and default settings.
+Centralizes paths, dataset schemas, split parameters, feature definitions, and model hyperparameters.
 """
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -44,12 +45,56 @@ class SplitConfig:
 
 
 @dataclass(frozen=True)
+class FeatureConfig:
+    """Feature engineering configuration."""
+
+    group_cols: list[str] = field(default_factory=lambda: ["center_id", "meal_id"])
+    target_col: str = "num_orders"
+    lags: list[int] = field(default_factory=lambda: [1, 2, 3, 4, 5, 10])
+    rolling_windows: list[int] = field(default_factory=lambda: [3, 5, 10])
+    use_log_target: bool = True
+    categorical_cols: list[str] = field(
+        default_factory=lambda: ["center_type", "category", "cuisine", "city_code", "region_code"]
+    )
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """XGBoost demand forecasting hyperparameters."""
+
+    n_estimators: int = 600
+    max_depth: int = 7
+    learning_rate: float = 0.03
+    subsample: float = 0.8
+    colsample_bytree: float = 0.8
+    min_child_weight: int = 3
+    gamma: float = 0.1
+    early_stopping_rounds: int = 40
+    random_state: int = 42
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert hyperparameters to dictionary for XGBoost."""
+        return {
+            "n_estimators": self.n_estimators,
+            "max_depth": self.max_depth,
+            "learning_rate": self.learning_rate,
+            "subsample": self.subsample,
+            "colsample_bytree": self.colsample_bytree,
+            "min_child_weight": self.min_child_weight,
+            "gamma": self.gamma,
+            "random_state": self.random_state,
+        }
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Master application configuration."""
 
     paths: PathConfig = field(default_factory=PathConfig)
     split: SplitConfig = field(default_factory=SplitConfig)
     inventory: InventoryConfig = field(default_factory=InventoryConfig)
+    feature: FeatureConfig = field(default_factory=FeatureConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
     random_seed: int = 42
 
 

@@ -5,8 +5,12 @@ incorporating uncertainty buffers, service levels, and lead-time variability.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
+import pandas as pd
+
+from demandiq.config import DEFAULT_CONFIG, InventoryConfig
 
 # Standard normal inverse CDF z-scores for common cycle service levels
 SERVICE_LEVEL_Z: dict[float, float] = {
@@ -31,6 +35,19 @@ class InventoryRecommendation:
     lead_time_weeks: int
 
 
+def get_z_score(service_level: float) -> float:
+    """Look up or estimate standard normal inverse CDF z-score."""
+    rounded_level = round(service_level, 2)
+    if rounded_level in SERVICE_LEVEL_Z:
+        return SERVICE_LEVEL_Z[rounded_level]
+    # Simple clamped interpolation fallback
+    if service_level >= 0.99:
+        return 2.3263
+    if service_level <= 0.80:
+        return 0.8416
+    return 1.6449
+
+
 def calculate_safety_stock(
     demand_std: float | np.ndarray,
     service_level: float = 0.95,
@@ -48,7 +65,7 @@ def calculate_safety_stock(
         lead_time_weeks: Supplier or preparation lead time in weeks.
         min_safety_stock: Floor buffer to protect against low-volume stockouts.
     """
-    z_score = SERVICE_LEVEL_Z.get(round(service_level, 2), 1.6449)
+    z_score = get_z_score(service_level)
     lead_time_factor = np.sqrt(max(1, lead_time_weeks))
     raw_ss = float(z_score * lead_time_factor * demand_std)
     return float(max(min_safety_stock, np.ceil(raw_ss)))
@@ -77,10 +94,59 @@ def recommend_inventory(
     net_recommended = max(0.0, gross_requirement - current_inventory)
 
     return InventoryRecommendation(
-        forecast_demand=round(forecast_demand, 2),
+        forecast_demand=round(float(forecast_demand), 2),
         safety_stock=round(ss, 2),
         recommended_preparation=round(net_recommended, 2),
         reorder_point=round(reorder_point, 2),
         service_level=service_level,
         lead_time_weeks=lead_time_weeks,
     )
+
+
+def generate_inventory_recommendations_df(
+    df: pd.DataFrame,
+    forecast_col: str = "forecast_orders",
+    demand_std_default: float = 20.0,
+    current_inventory_col: str | None = None,
+    config: InventoryConfig = DEFAULT_CONFIG.inventory,
+) -> pd.DataFrame:
+    """Generate batch inventory and kitchen preparation targets across all items."""
+    df_out = df.copy()
+    if forecast_col not in df_out.columns:
+        raise KeyError(f"Forecast column '{forecast_col}' not found in dataframe.")
+
+    z_score = get_z_score(config.service_level)
+    lead_factor = np.sqrt(max(1, config.lead_time_weeks))
+
+    # Calculate safety stock vectorized
+    ss_values = np.maximum(
+        config.min_safety_stock,
+        np.ceil(z_score * lead_factor * demand_std_default),
+    )
+    df_out["safety_stock"] = ss_values
+    df_out["reorder_point"] = (df_out[forecast_col] * config.lead_time_weeks) + ss_values
+
+    current_inv = (
+        df_out[current_inventory_col]
+        if (current_inventory_col and current_inventory_col in df_out.columns)
+        else 0.0
+    )
+    gross_needed = df_out[forecast_col] + ss_values
+    df_out["recommended_preparation"] = np.maximum(0.0, gross_needed - current_inv).round(1)
+
+    return df_out
+
+
+def compute_inventory_summary_kpis(df_recommendations: pd.DataFrame) -> dict[str, Any]:
+    """Compute aggregate business KPIs for operational reporting."""
+    total_forecast = float(df_recommendations["forecast_orders"].sum())
+    total_prep = float(df_recommendations["recommended_preparation"].sum())
+    total_ss = float(df_recommendations["safety_stock"].sum())
+    buffer_pct = round((total_ss / max(total_forecast, 1.0)) * 100, 2)
+
+    return {
+        "total_forecasted_units": round(total_forecast, 1),
+        "total_recommended_preparation_units": round(total_prep, 1),
+        "total_safety_stock_buffer_units": round(total_ss, 1),
+        "buffer_overhead_percentage": buffer_pct,
+    }
