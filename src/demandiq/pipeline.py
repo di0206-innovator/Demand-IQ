@@ -268,9 +268,15 @@ def main() -> None:
         action="store_true",
         help="Force running pipeline on synthetic benchmark data",
     )
+    parser.add_argument(
+        "--strict-raw",
+        action="store_true",
+        help="Disallow fallback to synthetic data and require real raw datasets",
+    )
     args = parser.parse_args()
 
-    results = run_training_pipeline(use_synthetic_fallback=args.synthetic or True)
+    use_fallback = not args.strict_raw or args.synthetic
+    results = run_training_pipeline(use_synthetic_fallback=use_fallback)
     print("\n" + "=" * 60)
     print("📈 DEMANDIQ PIPELINE EXECUTION SUMMARY")
     print("=" * 60)

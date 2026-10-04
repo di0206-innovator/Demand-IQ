@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from demandiq.config import DEFAULT_CONFIG, AppConfig
-from demandiq.utils import setup_logger
+from demandiq.utils import setup_logger, validate_safe_path
 
 logger = setup_logger(__name__)
 
@@ -271,7 +271,8 @@ def load_raw_datasets(
         FileNotFoundError: If mandatory raw data files (train, centers, meals) are missing.
         DataValidationError: If dataset fails schema or relationship rules.
     """
-    base_dir = data_dir or config.paths.data_raw
+    raw_path = data_dir or config.paths.data_raw
+    base_dir = validate_safe_path(raw_path, must_exist=False)
     datasets: dict[str, pd.DataFrame] = {}
 
     mandatory_keys = ["train", "centers", "meals"]
@@ -279,7 +280,7 @@ def load_raw_datasets(
 
     for key in keys_to_load:
         filename = RAW_DATA_FILES[key]
-        filepath = base_dir / filename
+        filepath = validate_safe_path(base_dir / filename, must_exist=False)
         if not filepath.exists():
             if key in mandatory_keys:
                 raise FileNotFoundError(
@@ -291,7 +292,10 @@ def load_raw_datasets(
             continue
 
         logger.info("Loading %s from %s", key, filepath)
-        datasets[key] = pd.read_csv(filepath)
+        try:
+            datasets[key] = pd.read_csv(filepath)
+        except Exception as e:
+            raise DataValidationError(f"Failed to read CSV at '{filepath}': {e}") from e
 
     if strict_validation:
         for key, df in datasets.items():
@@ -309,10 +313,16 @@ def time_based_split(
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Perform temporal split into train, validation, and test partitions.
 
-    Ensures no future data leaks into earlier sets.
+    Ensures no future data leaks into earlier sets and validates split consistency.
     """
     if time_col not in df.columns:
         raise KeyError(f"Time column '{time_col}' not present in dataframe.")
+
+    if config.split.train_end_week >= config.split.val_end_week:
+        raise ValueError(
+            f"Invalid split configuration: train_end_week ({config.split.train_end_week}) "
+            f"must be strictly less than val_end_week ({config.split.val_end_week})."
+        )
 
     train_df = df[df[time_col] <= config.split.train_end_week].copy()
     val_df = df[

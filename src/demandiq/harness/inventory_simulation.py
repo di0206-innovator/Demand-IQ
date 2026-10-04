@@ -61,9 +61,22 @@ class InventorySimulator:
         demand_std: float = 25.0,
         service_levels: list[float] | None = None,
     ) -> SimulationResult:
-        """Run multi-policy inventory replay simulation."""
+        """Run multi-policy inventory replay simulation using vectorized calculations."""
         if service_levels is None:
             service_levels = [0.80, 0.85, 0.90, 0.95, 0.98, 0.99]
+
+        if df_forecast_actual.empty:
+            timeline_df = pd.DataFrame(columns=[forecast_col, actual_col, "recommended_95"])
+            return SimulationResult(
+                optimal_service_level=0.95,
+                policy_comparisons=[],
+                simulation_timeline_df=timeline_df,
+            )
+
+        f_demands = df_forecast_actual[forecast_col].to_numpy(dtype=float)
+        a_demands = df_forecast_actual[actual_col].to_numpy(dtype=float)
+        total_actual = float(np.sum(a_demands))
+        n_samples = max(1, len(df_forecast_actual))
 
         policies: list[ServiceLevelSimulation] = []
         best_sl = 0.95
@@ -71,40 +84,25 @@ class InventorySimulator:
 
         for sl in service_levels:
             z = get_z_score(sl)
-            # Replay replenishment
-            total_actual = float(df_forecast_actual[actual_col].sum())
-            total_prep = 0.0
-            total_fulfilled = 0.0
-            total_stockout = 0.0
-            total_wasted = 0.0
-            stockout_events = 0
+            ss = max(5.0, np.ceil(z * demand_std))
 
-            for _, row in df_forecast_actual.iterrows():
-                f_demand = row[forecast_col]
-                a_demand = row[actual_col]
+            # Vectorized replenishment math
+            preps = f_demands + ss
+            fulfilled = np.minimum(a_demands, preps)
+            stockouts = np.maximum(0.0, a_demands - preps)
+            leftovers = np.maximum(0.0, preps - a_demands)
+            wastes = leftovers * self.spoilage_rate_per_week
+            stockout_events = int(np.sum(a_demands > preps))
 
-                # Safety stock buffer
-                ss = max(5.0, np.ceil(z * demand_std))
-                prep = f_demand + ss
-                total_prep += prep
+            total_prep = float(np.sum(preps))
+            total_fulfilled = float(np.sum(fulfilled))
+            total_stockout = float(np.sum(stockouts))
+            total_wasted = float(np.sum(wastes))
 
-                if a_demand > prep:
-                    # Stockout occurs
-                    stockout = a_demand - prep
-                    fulfilled = prep
-                    total_stockout += stockout
-                    stockout_events += 1
-                else:
-                    # Demand satisfied, potential waste/carryover
-                    fulfilled = a_demand
-                    leftover = prep - a_demand
-                    waste = leftover * self.spoilage_rate_per_week
-                    total_wasted += waste
-
-                total_fulfilled += fulfilled
-
-            fill_rate = (total_fulfilled / max(1.0, total_actual)) * 100.0
-            stockout_rate = (stockout_events / max(1, len(df_forecast_actual))) * 100.0
+            fill_rate = (
+                (total_fulfilled / max(1.0, total_actual)) * 100.0 if total_actual > 0 else 100.0
+            )
+            stockout_rate = (stockout_events / n_samples) * 100.0
 
             holding_cost = total_wasted * self.holding_cost_per_unit_week
             stockout_loss = total_stockout * (self.unit_price + self.stockout_penalty_per_unit)

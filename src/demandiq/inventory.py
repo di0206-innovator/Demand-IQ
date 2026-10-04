@@ -115,6 +115,12 @@ def generate_inventory_recommendations_df(
     if forecast_col not in df_out.columns:
         raise KeyError(f"Forecast column '{forecast_col}' not found in dataframe.")
 
+    if df_out.empty:
+        df_out["safety_stock"] = pd.Series(dtype=float)
+        df_out["reorder_point"] = pd.Series(dtype=float)
+        df_out["recommended_preparation"] = pd.Series(dtype=float)
+        return df_out
+
     z_score = get_z_score(config.service_level)
     lead_factor = np.sqrt(max(1, config.lead_time_weeks))
 
@@ -139,10 +145,20 @@ def generate_inventory_recommendations_df(
 
 def compute_inventory_summary_kpis(df_recommendations: pd.DataFrame) -> dict[str, Any]:
     """Compute aggregate business KPIs for operational reporting."""
+    if df_recommendations.empty:
+        return {
+            "total_forecasted_units": 0.0,
+            "total_recommended_preparation_units": 0.0,
+            "total_safety_stock_buffer_units": 0.0,
+            "buffer_overhead_percentage": 0.0,
+        }
+
     total_forecast = float(df_recommendations["forecast_orders"].sum())
     total_prep = float(df_recommendations["recommended_preparation"].sum())
     total_ss = float(df_recommendations["safety_stock"].sum())
-    buffer_pct = round((total_ss / max(total_forecast, 1.0)) * 100, 2)
+    buffer_pct = (
+        round((total_ss / max(total_forecast, 1.0)) * 100, 2) if total_forecast > 0 else 0.0
+    )
 
     return {
         "total_forecasted_units": round(total_forecast, 1),

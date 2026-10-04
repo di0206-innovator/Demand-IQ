@@ -83,6 +83,11 @@ def create_lag_features(
             raise ValueError(f"Lag must be >= 1 to prevent data leakage, got {lag}")
 
     df_out = df.copy()
+    if df_out.empty:
+        for lag in lags:
+            df_out[f"{target_col}_lag_{lag}"] = pd.Series(dtype=float)
+        return df_out
+
     df_out = df_out.sort_values(group_cols + ["week"]).reset_index(drop=True)
 
     grouped = df_out.groupby(group_cols)[target_col]
@@ -104,6 +109,12 @@ def create_rolling_features(
         windows = [3, 5, 10]
 
     df_out = df.copy()
+    if df_out.empty:
+        for window in windows:
+            df_out[f"{target_col}_roll_mean_{window}"] = pd.Series(dtype=float)
+            df_out[f"{target_col}_roll_std_{window}"] = pd.Series(dtype=float)
+        return df_out
+
     df_out = df_out.sort_values(group_cols + ["week"]).reset_index(drop=True)
 
     # Base shifted series (shift(1) ensures no current week leakage)
@@ -198,10 +209,8 @@ def build_feature_pipeline(
     feature_cols = [c for c in df.columns if c not in excluded_cols]
 
     # 8. Impute missing lag values (from initial time periods) if enabled
-    if impute_missing_lags:
-        for col in feature_cols:
-            if df[col].isna().any():
-                df[col] = df[col].fillna(0.0)
+    if impute_missing_lags and feature_cols and not df.empty:
+        df[feature_cols] = df[feature_cols].fillna(0.0)
 
     logger.info("Feature pipeline finished. Extracted %d feature columns.", len(feature_cols))
     return df, feature_cols, mappings

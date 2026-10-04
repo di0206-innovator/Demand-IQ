@@ -17,13 +17,35 @@ from app.components.charts import (
     plot_stress_test_comparison,
 )
 from demandiq import __version__
-from demandiq.config import DEFAULT_CONFIG
+from demandiq.config import DEFAULT_CONFIG, InventoryConfig
 from demandiq.harness.drift import DataDriftMonitor
-from demandiq.harness.inventory_simulation import InventorySimulator
+from demandiq.harness.inventory_simulation import InventorySimulator, SimulationResult
 from demandiq.harness.stress_testing import ScenarioStressTester
 from demandiq.inventory import generate_inventory_recommendations_df
 from demandiq.loop.self_improving import AdaptiveSelfImprovingLoop
+from demandiq.models import XGBoostDemandForecaster
 from demandiq.pipeline import run_training_pipeline
+
+
+@st.cache_resource(show_spinner=False)
+def get_cached_model() -> XGBoostDemandForecaster | None:
+    """Load and cache the trained XGBoost demand forecaster."""
+    model_file = DEFAULT_CONFIG.paths.models / "xgboost_model.joblib"
+    if model_file.exists():
+        return XGBoostDemandForecaster.load(model_file)
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_simulation(df_data: pd.DataFrame) -> SimulationResult:
+    """Execute and cache the multi-policy inventory replay simulation."""
+    simulator = InventorySimulator()
+    return simulator.run_simulation(
+        df_data,
+        forecast_col="forecast_orders",
+        actual_col="actual_orders",
+        demand_std=20.0,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -198,10 +220,15 @@ def main() -> None:
         )
 
         # Dynamic Recalculation with user sliders
+        active_inv_config = InventoryConfig(
+            service_level=target_service_level,
+            lead_time_weeks=lead_time_weeks,
+        )
         recomputed_df = generate_inventory_recommendations_df(
             df_recs,
             forecast_col="forecast_orders",
             demand_std_default=22.0,
+            config=active_inv_config,
         )
 
         # Table Display
@@ -222,13 +249,7 @@ def main() -> None:
 
         # Simulator Cost Curve
         st.markdown("### Economic Trade-Off Curve: Service Level vs Operational Cost")
-        simulator = InventorySimulator()
-        sim_res = simulator.run_simulation(
-            df_recs,
-            forecast_col="forecast_orders",
-            actual_col="actual_orders",
-            demand_std=20.0,
-        )
+        sim_res = get_cached_simulation(df_recs)
         fig_tradeoff = plot_inventory_cost_tradeoff(sim_res.policy_comparisons)
         st.plotly_chart(fig_tradeoff, use_container_width=True)
 
@@ -255,30 +276,33 @@ def main() -> None:
         st.subheader("Operational Stress Testing & Drift Monitoring Harness")
 
         st.markdown("### 1. Macro & Disruption Scenario Stress Tests")
-        from demandiq.models import XGBoostDemandForecaster
+        model = get_cached_model()
+        feature_cols: list[str] = model.feature_names if model is not None else []
 
-        model_file = DEFAULT_CONFIG.paths.models / "xgboost_model.joblib"
-        if model_file.exists():
-            model = XGBoostDemandForecaster.load(model_file)
-            feature_cols = model.feature_names
+        if model is not None and feature_cols and not df_features.empty:
             stress_tester = ScenarioStressTester(model, feature_cols)
             stress_res = stress_tester.run_all_stress_tests(df_features)
 
             fig_stress = plot_stress_test_comparison(stress_res.scenario_outcomes)
             st.plotly_chart(fig_stress, use_container_width=True)
             st.success(stress_res.summary_verdict)
+        else:
+            st.info("Forecaster model or feature dataset not yet generated.")
 
         st.markdown("### 2. Feature & Distribution Drift Monitor")
-        drift_monitor = DataDriftMonitor()
-        drift_report = drift_monitor.evaluate_drift(
-            baseline_df=df_features.iloc[: len(df_features) // 2],
-            current_df=df_features.iloc[len(df_features) // 2 :],
-            feature_cols=feature_cols if "feature_cols" in locals() else [],
-        )
+        if not df_features.empty and feature_cols:
+            drift_monitor = DataDriftMonitor()
+            drift_report = drift_monitor.evaluate_drift(
+                baseline_df=df_features.iloc[: len(df_features) // 2],
+                current_df=df_features.iloc[len(df_features) // 2 :],
+                feature_cols=feature_cols,
+            )
 
-        st.metric("Overall Drift Status", drift_report.overall_status)
-        fig_drift = plot_drift_psi_scores(drift_report.feature_drift_scores)
-        st.plotly_chart(fig_drift, use_container_width=True)
+            st.metric("Overall Drift Status", drift_report.overall_status)
+            fig_drift = plot_drift_psi_scores(drift_report.feature_drift_scores)
+            st.plotly_chart(fig_drift, use_container_width=True)
+        else:
+            st.info("Feature dataset not available for drift evaluation.")
 
     # TAB 5: SELF-IMPROVING LOOP
     with tab_loop:
@@ -288,7 +312,7 @@ def main() -> None:
             "and maintains Champion vs Challenger auto-retraining."
         )
 
-        if "model" in locals() and "feature_cols" in locals():
+        if model is not None and feature_cols and not df_recs.empty:
             loop_engine = AdaptiveSelfImprovingLoop(champion_model=model, feature_cols=feature_cols)
             loop_res = loop_engine.process_incoming_batch(df_recs)
 
@@ -319,6 +343,8 @@ def main() -> None:
                 for p in list(loop_engine.profiler.profiles.values())[:10]
             ]
             st.table(pd.DataFrame(sample_profiles))
+        else:
+            st.info("Pipeline models or recommendation logs not available for self-improving loop.")
 
 
 if __name__ == "__main__":

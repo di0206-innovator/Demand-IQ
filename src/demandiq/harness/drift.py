@@ -61,9 +61,15 @@ def calculate_psi(
     actual: np.ndarray,
     num_bins: int = 10,
 ) -> float:
-    """Calculate Population Stability Index (PSI) between baseline and production arrays."""
-    exp_clean = expected[~np.isnan(expected)]
-    act_clean = actual[~np.isnan(actual)]
+    """Calculate Population Stability Index (PSI) between baseline and production arrays.
+
+    Robust against non-finite values (NaN, Inf, -Inf) and degenerate single-value distributions.
+    """
+    exp_arr = np.asarray(expected, dtype=float)
+    act_arr = np.asarray(actual, dtype=float)
+
+    exp_clean = exp_arr[np.isfinite(exp_arr)]
+    act_clean = act_arr[np.isfinite(act_arr)]
 
     if len(exp_clean) == 0 or len(act_clean) == 0:
         return 0.0
@@ -126,12 +132,17 @@ class DataDriftMonitor:
 
             psi = calculate_psi(exp_vals, act_vals)
 
-            # Two-sample Kolmogorov-Smirnov test
-            exp_clean = exp_vals[~np.isnan(exp_vals)]
-            act_clean = act_vals[~np.isnan(act_vals)]
+            # Two-sample Kolmogorov-Smirnov test with non-finite filtering
+            exp_clean = exp_vals[np.isfinite(exp_vals)]
+            act_clean = act_vals[np.isfinite(act_vals)]
             if len(exp_clean) > 5 and len(act_clean) > 5:
-                ks_res = stats.ks_2samp(exp_clean, act_clean)
-                ks_stat, ks_p = float(ks_res.statistic), float(ks_res.pvalue)
+                # Handle zero-variance constant distributions gracefully
+                if np.std(exp_clean) == 0.0 and np.std(act_clean) == 0.0:
+                    ks_stat = 0.0 if exp_clean[0] == act_clean[0] else 1.0
+                    ks_p = 1.0 if exp_clean[0] == act_clean[0] else 0.0
+                else:
+                    ks_res = stats.ks_2samp(exp_clean, act_clean)
+                    ks_stat, ks_p = float(ks_res.statistic), float(ks_res.pvalue)
             else:
                 ks_stat, ks_p = 0.0, 1.0
 

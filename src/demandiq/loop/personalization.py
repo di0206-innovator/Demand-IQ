@@ -49,6 +49,10 @@ class HyperPersonalizedProfiler:
         logger.info("Calibrating hyper-personalized profiles across historical demand data...")
         profiles: dict[tuple[int, int], SkuCenterProfile] = {}
 
+        if historical_df.empty:
+            self.profiles = {}
+            return self.profiles
+
         if "actual_orders" in historical_df.columns:
             actual_col = "actual_orders"
 
@@ -82,10 +86,14 @@ class HyperPersonalizedProfiler:
                 prices = grp["checkout_price"].to_numpy()
                 demands = grp[actual_col].to_numpy()
                 if np.std(prices) > 1e-3 and np.std(demands) > 1e-3:
-                    log_p = np.log(np.maximum(prices, 1.0))
-                    log_d = np.log1p(np.maximum(demands, 0.0))
-                    slope, _ = np.polyfit(log_p, log_d, 1)
-                    elasticity = float(np.clip(slope, -4.0, 0.5))
+                    try:
+                        log_p = np.log(np.maximum(prices, 1.0))
+                        log_d = np.log1p(np.maximum(demands, 0.0))
+                        slope, _ = np.polyfit(log_p, log_d, 1)
+                        if np.isfinite(slope):
+                            elasticity = float(np.clip(slope, -4.0, 0.5))
+                    except (np.linalg.LinAlgError, ValueError):
+                        elasticity = -1.2
 
             # 4. Tiers and Custom Safety Stock
             vol_tier: Literal["LOW", "MEDIUM", "HIGH"] = (

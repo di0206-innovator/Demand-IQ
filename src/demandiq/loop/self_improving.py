@@ -50,29 +50,39 @@ class AdaptiveSelfImprovingLoop:
         X_df: pd.DataFrame,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Generate point forecasts with hyper-personalized residual bias corrections and custom safety stocks."""
+        if X_df.empty:
+            return np.array([], dtype=float), np.array([], dtype=float)
+
         base_preds = self.champion_model.predict(X_df[self.feature_cols])
-        adaptive_preds = []
-        custom_safety_stocks = []
+        n_rows = len(X_df)
 
-        for idx, row in X_df.reset_index(drop=True).iterrows():
-            raw_pred = base_preds[idx]
-            c_id = int(row.get("center_id", 0))
-            m_id = int(row.get("meal_id", 0))
+        center_ids = (
+            X_df["center_id"].to_numpy(dtype=int)
+            if "center_id" in X_df.columns
+            else np.zeros(n_rows, dtype=int)
+        )
+        meal_ids = (
+            X_df["meal_id"].to_numpy(dtype=int)
+            if "meal_id" in X_df.columns
+            else np.zeros(n_rows, dtype=int)
+        )
 
-            profile = self.profiler.get_profile(c_id, m_id)
+        adaptive_preds = np.empty(n_rows, dtype=float)
+        custom_safety_stocks = np.empty(n_rows, dtype=float)
+
+        for idx, (c_id, m_id, raw_pred) in enumerate(
+            zip(center_ids, meal_ids, base_preds, strict=False)
+        ):
+            profile = self.profiler.get_profile(int(c_id), int(m_id))
             if profile is not None:
-                # Apply smoothed residual bias correction
                 corrected = raw_pred + (self.adaptation_rate * profile.recent_residual_bias)
-                adaptive_pred = float(max(0.0, corrected))
-                ss = profile.recommended_safety_stock
+                adaptive_preds[idx] = max(0.0, corrected)
+                custom_safety_stocks[idx] = profile.recommended_safety_stock
             else:
-                adaptive_pred = float(raw_pred)
-                ss = 15.0
+                adaptive_preds[idx] = float(raw_pred)
+                custom_safety_stocks[idx] = 15.0
 
-            adaptive_preds.append(adaptive_pred)
-            custom_safety_stocks.append(ss)
-
-        return np.array(adaptive_preds), np.array(custom_safety_stocks)
+        return adaptive_preds, custom_safety_stocks
 
     def process_incoming_batch(
         self,
@@ -81,6 +91,17 @@ class AdaptiveSelfImprovingLoop:
         force_retrain: bool = False,
     ) -> LoopUpdateResult:
         """Process newly realized weekly demand batch, update profiles, and evaluate Champion vs Challenger."""
+        if batch_df.empty:
+            return LoopUpdateResult(
+                champion_wmape=0.0,
+                adaptive_wmape=0.0,
+                challenger_wmape=None,
+                promoted_new_champion=False,
+                bias_correction_improvement_pct=0.0,
+                retrain_trigger_fired=False,
+                trigger_reasons=["Empty batch provided."],
+            )
+
         self.iteration_count += 1
         logger.info("Executing Self-Improving Loop (Iteration #%d)...", self.iteration_count)
 

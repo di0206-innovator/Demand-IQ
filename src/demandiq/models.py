@@ -12,15 +12,28 @@ import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
 from demandiq.config import DEFAULT_CONFIG, ModelConfig
-from demandiq.utils import calculate_rmsle, calculate_wmape, setup_logger
+from demandiq.utils import calculate_rmsle, calculate_wmape, setup_logger, validate_safe_path
 
 logger = setup_logger(__name__)
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
-    """Compute standard forecasting evaluation metrics."""
+    """Compute standard forecasting evaluation metrics.
+
+    Robust against empty arrays, non-finite values (NaN/Inf), and negative predictions.
+    """
     y_t = np.asarray(y_true, dtype=float)
     y_p = np.clip(np.asarray(y_pred, dtype=float), 0, None)
+
+    if y_t.size == 0 or y_p.size == 0:
+        return {"MAE": 0.0, "RMSE": 0.0, "WMAPE": 0.0, "RMSLE": 0.0}
+
+    valid_mask = np.isfinite(y_t) & np.isfinite(y_p)
+    if not np.all(valid_mask):
+        y_t = y_t[valid_mask]
+        y_p = y_p[valid_mask]
+        if y_t.size == 0:
+            return {"MAE": 0.0, "RMSE": 0.0, "WMAPE": 0.0, "RMSLE": 0.0}
 
     mae = float(mean_absolute_error(y_t, y_p))
     rmse = float(root_mean_squared_error(y_t, y_p))
@@ -77,10 +90,14 @@ class NaiveBaselineForecaster(BaseForecaster):
     ) -> "NaiveBaselineForecaster":
         df = X.copy()
         df["_target"] = y.to_numpy()
-        self.global_median = float(y.median())
+        self.global_median = float(y.median()) if not y.empty else 0.0
 
-        grouped = df.groupby(self.group_cols)["_target"].median()
-        self.group_medians = grouped.to_dict()
+        if not df.empty and all(col in df.columns for col in self.group_cols):
+            grouped = df.groupby(self.group_cols)["_target"].median()
+            self.group_medians = grouped.to_dict()
+        else:
+            self.group_medians = {}
+
         logger.info(
             "Fitted NaiveBaselineForecaster with %d group medians; global median=%.2f",
             len(self.group_medians),
@@ -89,11 +106,13 @@ class NaiveBaselineForecaster(BaseForecaster):
         return self
 
     def predict(self, X: pd.DataFrame) -> np.ndarray:
-        preds = []
-        for _, row in X.iterrows():
-            key = tuple(row[col] for col in self.group_cols)
-            val = self.group_medians.get(key, self.global_median)
-            preds.append(val)
+        """Generate vectorized group median baseline predictions."""
+        if X.empty:
+            return np.array([], dtype=float)
+
+        # Vectorized key extraction using zip instead of slow iterrows
+        keys = list(zip(*(X[col] for col in self.group_cols), strict=False))
+        preds = [self.group_medians.get(k, self.global_median) for k in keys]
         return np.clip(np.array(preds, dtype=float), 0, None)
 
 
@@ -168,6 +187,15 @@ class XGBoostDemandForecaster(BaseForecaster):
         if not self.is_fitted or self.model is None:
             raise RuntimeError("Cannot predict with unfitted model. Call fit() first.")
 
+        if X.empty:
+            return np.array([], dtype=float)
+
+        missing_feats = [f for f in self.feature_names if f not in X.columns]
+        if missing_feats:
+            raise KeyError(
+                f"Missing required feature column(s) for prediction: {missing_feats[:5]}"
+            )
+
         X_eval = X[self.feature_names].copy()
         raw_preds = self.model.predict(X_eval)
 
@@ -200,6 +228,13 @@ class XGBoostDemandForecaster(BaseForecaster):
         if not self.is_fitted or self.model is None:
             raise RuntimeError("Model is not fitted.")
 
+        if X_sample.empty:
+            return (
+                np.empty((0, len(self.feature_names))),
+                np.empty((0, len(self.feature_names))),
+                self.feature_names,
+            )
+
         X_eval = X_sample[self.feature_names].copy()
         if len(X_eval) > max_samples:
             X_eval = X_eval.sample(n=max_samples, random_state=self.config.random_state)
@@ -208,12 +243,17 @@ class XGBoostDemandForecaster(BaseForecaster):
         shap_vals = explainer.shap_values(X_eval)
         return shap_vals, X_eval.to_numpy(), self.feature_names
 
-    def save(self, filepath: Path | str) -> None:
-        """Serialize trained model and feature metadata to disk."""
+    def save(self, filepath: Path | str, allowed_base: Path | str | None = None) -> None:
+        """Serialize trained model and feature metadata to disk safely.
+
+        Args:
+            filepath: Destination file path.
+            allowed_base: Optional base directory to restrict path traversal.
+        """
         if not self.is_fitted or self.model is None:
             raise RuntimeError("Cannot save unfitted model.")
 
-        path = Path(filepath)
+        path = validate_safe_path(filepath, allowed_base=allowed_base, must_exist=False)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "model": self.model,
@@ -225,21 +265,104 @@ class XGBoostDemandForecaster(BaseForecaster):
         logger.info("Saved model artifact to %s", path)
 
     @classmethod
-    def load(cls, filepath: Path | str) -> "XGBoostDemandForecaster":
-        """Load serialized model artifact from disk."""
-        path = Path(filepath)
-        if not path.exists():
-            raise FileNotFoundError(f"Model artifact not found at {path}")
+    def load(
+        cls,
+        filepath: Path | str,
+        allowed_base: Path | str | None = None,
+        max_size_bytes: int = 500 * 1024 * 1024,
+    ) -> "XGBoostDemandForecaster":
+        """Load and validate serialized model artifact from disk safely.
 
-        payload: dict[str, Any] = joblib.load(path)
+        Args:
+            filepath: Path to artifact file.
+            allowed_base: Optional base directory to prevent path traversal attacks.
+            max_size_bytes: Maximum allowed file size in bytes to prevent DoS.
+
+        Raises:
+            FileNotFoundError: If model file does not exist.
+            ValueError: If path traversal, size limit, or payload integrity is violated.
+        """
+        path = validate_safe_path(
+            filepath,
+            allowed_base=allowed_base,
+            must_exist=True,
+            max_size_bytes=max_size_bytes,
+        )
+
+        payload: Any = joblib.load(path)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Corrupt model artifact: expected dict payload, got {type(payload)}")
+
+        required_keys = {"model", "feature_names", "use_log_target", "config"}
+        missing_keys = required_keys - set(payload.keys())
+        if missing_keys:
+            raise ValueError(f"Corrupt model artifact: missing required key(s) {missing_keys}")
+
+        if not isinstance(payload["model"], xgb.XGBRegressor):
+            raise ValueError(
+                f"Security violation: unexpected model class {type(payload['model'])} in artifact."
+            )
+
         forecaster = cls(
             model_config=payload["config"],
             use_log_target=payload["use_log_target"],
         )
         forecaster.model = payload["model"]
-        forecaster.feature_names = payload["feature_names"]
+        forecaster.feature_names = list(payload["feature_names"])
         forecaster.is_fitted = True
         logger.info(
             "Loaded model artifact from %s with %d features", path, len(forecaster.feature_names)
         )
+        return forecaster
+
+    def save_native(self, dir_path: Path | str, allowed_base: Path | str | None = None) -> None:
+        """Secure native serialization using XGBoost JSON model format (avoids pickle)."""
+        import json
+
+        if not self.is_fitted or self.model is None:
+            raise RuntimeError("Cannot save unfitted model.")
+
+        target_dir = validate_safe_path(dir_path, allowed_base=allowed_base, must_exist=False)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        model_file = target_dir / "xgboost_model.json"
+        meta_file = target_dir / "metadata.json"
+
+        self.model.save_model(str(model_file))
+        meta = {
+            "feature_names": self.feature_names,
+            "use_log_target": self.use_log_target,
+            "config": self.config.to_dict(),
+        }
+        with open(meta_file, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+        logger.info("Saved native model artifact securely to %s", target_dir)
+
+    @classmethod
+    def load_native(
+        cls, dir_path: Path | str, allowed_base: Path | str | None = None
+    ) -> "XGBoostDemandForecaster":
+        """Secure native deserialization using XGBoost JSON model format."""
+        import json
+
+        target_dir = validate_safe_path(dir_path, allowed_base=allowed_base, must_exist=True)
+        model_file = target_dir / "xgboost_model.json"
+        meta_file = target_dir / "metadata.json"
+
+        if not model_file.exists() or not meta_file.exists():
+            raise FileNotFoundError(f"Native model files missing in {target_dir}")
+
+        with open(meta_file, encoding="utf-8") as f:
+            meta = json.load(f)
+
+        forecaster = cls(
+            model_config=ModelConfig(**meta["config"]),
+            use_log_target=meta["use_log_target"],
+        )
+        model = xgb.XGBRegressor()
+        model.load_model(str(model_file))
+        forecaster.model = model
+        forecaster.feature_names = meta["feature_names"]
+        forecaster.is_fitted = True
         return forecaster
